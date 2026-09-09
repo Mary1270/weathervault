@@ -32,6 +32,7 @@ WeatherVault = _contract_module.WeatherVault
 gl = _contract_module.gl
 
 from genlayer import tx_context, Address, _TransferRecorder  # noqa: E402
+import datetime as _real_datetime_module  # noqa: E402
 
 
 def make_contract() -> "WeatherVault":
@@ -44,3 +45,39 @@ def transfers():
 
 def reset_transfers():
     _TransferRecorder.reset()
+
+
+class _ControllableDatetime:
+    """
+    TEST-ONLY stand-in for the `datetime` class contract.py imports.
+    Swapped into the loaded contract module's namespace so tests can
+    pin "now" to an exact value (simulating elapsed time for
+    expire_policy) without needing a real GenVM. `strptime` delegates
+    to the real implementation so stored event_date strings still
+    parse correctly.
+    """
+
+    _current = None
+
+    @classmethod
+    def now(cls):
+        if cls._current is not None:
+            return cls._current
+        return _real_datetime_module.datetime.now()
+
+    @staticmethod
+    def strptime(*args, **kwargs):
+        return _real_datetime_module.datetime.strptime(*args, **kwargs)
+
+
+_contract_module.datetime = _ControllableDatetime
+
+
+def set_now(dt):
+    """Pin the contract's notion of 'now' to an exact datetime for this test."""
+    _ControllableDatetime._current = dt
+
+
+def reset_now():
+    """Return the contract's notion of 'now' to the real wall clock."""
+    _ControllableDatetime._current = None

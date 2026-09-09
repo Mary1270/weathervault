@@ -1,7 +1,8 @@
 import json
 import unittest
+from datetime import datetime, timedelta
 
-from _bootstrap import make_contract, gl, transfers, reset_transfers
+from _bootstrap import make_contract, gl, transfers, reset_transfers, set_now, reset_now
 from genlayer import tx_context
 
 
@@ -30,10 +31,17 @@ THREE_URLS = [
 ]
 
 
+T0 = datetime(2026, 9, 1, 12, 0, 0)
+
+
 class BaseCase(unittest.TestCase):
     def setUp(self):
         self.c = make_contract()
         reset_transfers()
+        set_now(T0)
+
+    def tearDown(self):
+        reset_now()
 
     def deposit(self, sender, amount):
         with tx_context(sender, amount):
@@ -120,18 +128,19 @@ class TestWithdraw(BaseCase):
 
     def test_cannot_withdraw_locked_capital(self):
         self.deposit("0xU1", 5000)
-        self.create_policy(coverage=4000)
-        # only 1000 (+ premium) unlocked; withdrawing all 5000 shares should fail
+        self.create_policy(coverage=2000)
+        # only ~3100 (of 5100) unlocked after the policy; withdrawing all
+        # 5000 shares should fail
         with self.assertRaises(Exception):
             with tx_context("0xU1"):
                 self.c.withdraw(5000)
 
     def test_can_withdraw_up_to_available_when_partially_locked(self):
         self.deposit("0xU1", 5000)
-        self.create_policy(premium=0 + 1, coverage=4000)  # locks 4000, pool=5001
+        self.create_policy(premium=100, coverage=2000)  # locks 2000, pool=5100
         with tx_context("0xU1"):
-            rec = json.loads(self.c.withdraw(1000))  # well within the ~1001 available
-        self.assertEqual(transfers(), [{"to": "0xU1", "value": 1000}])
+            rec = json.loads(self.c.withdraw(1000))  # well within the ~3100 available
+        self.assertEqual(transfers(), [{"to": "0xU1", "value": 1020}])
         self.assertEqual(rec["shares"], "4000")
 
 
@@ -191,6 +200,119 @@ class TestCreatePolicyValidation(BaseCase):
         self.create_policy()
         self.create_policy()
         self.assertEqual(self.c.total_policies(), 2)
+
+
+class TestCoverageAdmissionControl(BaseCase):
+    """
+    Steward-requested fix: bounded premium-to-coverage rules that
+    prevent locking most of the pool for a trivial premium.
+    """
+
+    def test_min_premium_rate_blocks_griefing_low_premium(self):
+        self.deposit("0xU1", 100000)
+        # 1 wei premium trying to lock nearly the whole pool
+        with self.assertRaises(Exception):
+            self.create_policy(premium=1, coverage=99000)
+
+    def test_premium_exactly_at_minimum_rate_succeeds(self):
+        self.deposit("0xU1", 100000)
+        # coverage=40000 -> min premium = 1% = 400
+        rec = self.create_policy(premium=400, coverage=40000)
+        self.assertEqual(rec["status"], "active")
+
+    def test_premium_one_below_minimum_rate_rejected(self):
+        self.deposit("0xU1", 100000)
+        with self.assertRaises(Exception):
+            self.create_policy(premium=399, coverage=40000)
+
+    def test_max_policy_share_of_pool_blocks_single_policy_dominance(self):
+        self.deposit("0xU1", 10000)
+        # 60% of pool in one policy, well above the 50% cap, even with
+        # an adequate premium
+        with self.assertRaises(Exception):
+            self.create_policy(premium=600, coverage=6000)
+
+    def test_policy_exactly_at_pool_share_cap_succeeds(self):
+        self.deposit("0xU1", 10000)
+        # exactly 50% of the pool, with an adequate premium
+        rec = self.create_policy(premium=500, coverage=5000)
+        self.assertEqual(rec["status"], "active")
+
+    def test_cap_is_based_on_pool_before_this_policys_own_premium(self):
+        # A large premium attached to the SAME call must not inflate
+        # the pool used to justify its own coverage cap.
+        self.deposit("0xU1", 10000)
+        with self.assertRaises(Exception):
+            self.create_policy(premium=50000, coverage=6000)
+
+
+class TestExpirePolicy(BaseCase):
+    def test_cannot_expire_before_event_date_plus_buffer(self):
+        self.deposit("0xU1", 100000)
+        self.create_policy(event_date="2026-09-10")
+        set_now(datetime(2026, 9, 12))  # event date passed, buffer has not
+        with self.assertRaises(Exception):
+            self.c.expire_policy("0")
+
+    def test_can_expire_exactly_at_buffer_deadline(self):
+        self.deposit("0xU1", 100000)
+        self.create_policy(event_date="2026-09-10")
+        set_now(datetime(2026, 9, 10) + self.c.EXPIRY_BUFFER)
+        rec = json.loads(self.c.expire_policy("0"))
+        self.assertEqual(rec["status"], "expired")
+
+    def test_expiry_releases_lock_with_no_payout(self):
+        self.deposit("0xU1", 100000)
+        self.create_policy(premium=500, coverage=40000, event_date="2026-09-10")
+        set_now(datetime(2026, 9, 10) + self.c.EXPIRY_BUFFER + timedelta(days=1))
+        rec = json.loads(self.c.expire_policy("0"))
+        self.assertEqual(rec["status"], "expired")
+        state = json.loads(self.c.vault_state())
+        self.assertEqual(state["locked_amount"], "0")
+        # premium stays in the pool; no transfer to the policyholder
+        self.assertEqual(transfers(), [])
+
+    def test_only_active_policy_can_expire(self):
+        self.deposit("0xU1", 100000)
+        self.create_policy(premium=500, coverage=40000, event_date="2026-09-10")
+        set_pipeline(
+            "page",
+            {
+                "LOCATION_MATCH": "Match",
+                "FRESHNESS": "Current",
+                "METRIC_VALUE": "5",
+                "UNIT": "mm",
+            },
+        )
+        self.c.resolve_policy("0", THREE_URLS)  # -> resolved_nopay
+        set_now(datetime(2026, 9, 10) + self.c.EXPIRY_BUFFER + timedelta(days=1))
+        with self.assertRaises(Exception):
+            self.c.expire_policy("0")
+
+    def test_cannot_expire_twice(self):
+        self.deposit("0xU1", 100000)
+        self.create_policy(event_date="2026-09-10")
+        set_now(datetime(2026, 9, 10) + self.c.EXPIRY_BUFFER)
+        self.c.expire_policy("0")
+        with self.assertRaises(Exception):
+            self.c.expire_policy("0")
+
+    def test_callable_by_anyone(self):
+        self.deposit("0xU1", 100000)
+        self.create_policy(event_date="2026-09-10")
+        set_now(datetime(2026, 9, 10) + self.c.EXPIRY_BUFFER)
+        with tx_context("0xSomeoneElse"):
+            rec = json.loads(self.c.expire_policy("0"))
+        self.assertEqual(rec["status"], "expired")
+
+    def test_expiring_unknown_policy_raises(self):
+        with self.assertRaises(Exception):
+            self.c.expire_policy("999")
+
+    def test_invalid_event_date_format_rejected_at_creation(self):
+        self.deposit("0xU1", 100000)
+        with self.assertRaises(Exception):
+            self.create_policy(event_date="10-09-2026")  # wrong format
 
 
 class TestResolvePolicy(BaseCase):
@@ -313,11 +435,11 @@ class TestResolvePolicy(BaseCase):
 class TestSolvencyInvariant(BaseCase):
     def test_multiple_policies_cannot_over_lock_pool(self):
         self.deposit("0xU1", 10000)
-        self.create_policy(premium=0 + 1, coverage=6000)
-        self.create_policy(premium=0 + 1, coverage=4001)
-        # second policy should fail: only ~4000 unlocked left after first
+        self.create_policy(premium=100, coverage=4000)
+        self.create_policy(premium=100, coverage=3000)
+        # third policy should fail: only ~3300 unlocked left after the first two
         with self.assertRaises(Exception):
-            self.create_policy(premium=0 + 1, coverage=4001)
+            self.create_policy(premium=100, coverage=3500)
 
     def test_underwriter_cannot_withdraw_below_locked_floor_across_policies(self):
         self.deposit("0xU1", 10000)

@@ -65,6 +65,22 @@ class TestParseMetricValue(unittest.TestCase):
     def test_comma_thousands_stripped(self):
         self.assertEqual(self.c._parse_metric_value("1,024mm"), 1024.0)
 
+    def test_hyphen_range_is_unparseable_not_first_bound(self):
+        # Same class of bug a steward review found and required fixing
+        # in FlightShield's delay-text parser, found proactively here
+        # too: the old version silently returned 30.0 (the first
+        # bound) instead of flagging the range as ambiguous.
+        self.assertIsNone(self.c._parse_metric_value("30-45mm"))
+
+    def test_between_and_range_is_unparseable(self):
+        self.assertIsNone(self.c._parse_metric_value("between 30 and 45mm"))
+
+    def test_word_to_range_is_unparseable(self):
+        self.assertIsNone(self.c._parse_metric_value("30 to 45 mm"))
+
+    def test_en_dash_range_is_unparseable(self):
+        self.assertIsNone(self.c._parse_metric_value("30\u201345mm"))
+
 
 class TestNormalizeUnitText(unittest.TestCase):
     def setUp(self):
