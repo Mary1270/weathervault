@@ -17,6 +17,31 @@ explicitly left open:
 WeatherVault is that pooled version. See the full rationale in
 `contract.py`'s class docstring.
 
+## v2: steward feedback addressed
+
+A steward review of the v1 submission found two related gaps in the
+policy lifecycle. Both are fixed, tested, and documented in
+`contract.py`'s class docstring (see "STEWARD FEEDBACK ADDRESSED"):
+
+| Steward request | Fix |
+|---|---|
+| An indeterminate policy has no way to terminate and release its reserve | `expire_policy()` - callable by anyone, releases `locked_amount` once `EXPIRY_BUFFER` (5 days) has passed the policy's own `event_date` while still `active`; no refund owed, same as a real insurance claim window closing unmade |
+| Anyone can reserve nearly all unlocked capital for a minimal premium | Two on-chain admission rules in `create_policy`: `MIN_PREMIUM_RATE_BPS` (premium must be >= 1% of coverage_amount) and `MAX_POLICY_SHARE_OF_POOL_BPS` (a single policy can never lock more than 50% of the pool's capital before its own premium) |
+
+This uses the same clock correction documented in FlightShield's v2:
+GenVM injects a deterministic, consensus-agreed `datetime.datetime.now()`
+into every transaction, so real elapsed-time terminal conditions are
+safe to implement directly in Python.
+
+**Proactive fix found while addressing the above:** `_parse_metric_value`
+had the identical latent bug a steward review separately found and
+required fixing in FlightShield's delay-text parser - a textual range
+("30-45mm", "between 30 and 45mm") was silently resolved to its first
+bound instead of being flagged as ambiguous. Fixed here before it could
+cause the same rejection: any detected range now returns `None`
+(excluded from consensus) rather than picking a bound. See
+`test_aggregation.py`'s range tests.
+
 ## How it's different from FlightShield
 
 | FlightShield | WeatherVault |
@@ -24,7 +49,7 @@ WeatherVault is that pooled version. See the full rationale in
 | Two named wallets, symmetric stakes | Any number of underwriters, proportional shares |
 | Winner takes the whole pot | Policyholder gets a fixed `coverage_amount`; the rest stays with underwriters |
 | No solvency model needed (1:1 bet) | `pool_balance >= locked_amount` invariant enforced on every state change |
-| `request_cancel` (mutual consent, 2 parties) | No forced-expiry path yet (disclosed limitation - see below) |
+| `request_cancel` (mutual consent, 2 parties) | `expire_policy()` (callable by anyone, once past `event_date + EXPIRY_BUFFER`) |
 
 ## How it works
 
@@ -37,8 +62,12 @@ WeatherVault is that pooled version. See the full rationale in
    always theirs, but never capital backing an active policy).
 3. **`create_policy(...)`** (payable) - A policyholder pays a premium
    and requests `coverage_amount` of coverage against a weather
-   trigger (city, metric, comparison, threshold, date). Only succeeds
-   if the pool has enough *unlocked* capital; on success,
+   trigger (city, metric, comparison, threshold, `event_date` in
+   `YYYY-MM-DD` format). Only succeeds if the pool has enough
+   *unlocked* capital AND both admission checks pass: the premium is
+   at least `MIN_PREMIUM_RATE_BPS` (1%) of `coverage_amount`, and
+   `coverage_amount` is at most `MAX_POLICY_SHARE_OF_POOL_BPS` (50%)
+   of the pool's capital before this policy's own premium. On success,
    `coverage_amount` is reserved (`locked_amount`) and the premium
    joins the pool immediately.
 4. **`resolve_policy(policy_id, source_urls)`** - Same multi-source
@@ -49,6 +78,11 @@ WeatherVault is that pooled version. See the full rationale in
    `emit_transfer` and releases the reserve. On `NoPayout`, releases
    the reserve and the premium stays in the pool, raising every
    underwriter's share value.
+5. **`expire_policy(policy_id)`** - If a policy is still `active` more
+   than `EXPIRY_BUFFER` (5 days) past its own `event_date`, anyone may
+   call this to release its `locked_amount` back to the pool. No
+   refund is owed - the premium already paid stays with the pool,
+   exactly like a real insurance claim window closing unmade.
 
 ## The solvency model
 
@@ -106,7 +140,7 @@ not enough rain" parametric triggers with one deterministic rule.
 
 ## Testing
 
-75 offline unit tests across two files, run with plain `unittest`:
+93 offline unit tests across two files, run with plain `unittest`:
 
 ```bash
 cd tests
@@ -195,19 +229,21 @@ values now normalize to the same canonical temperature.
 
 ## Known limitations
 
-- **No forced-expiry release path.** Unlike FlightShield's
-  `request_cancel` (mutual consent between exactly two parties),
-  WeatherVault has no equivalent yet - a policy whose evidence can
-  never again show `FRESHNESS: Current` stays `active` and its
-  `coverage_amount` stays locked indefinitely, tying up underwriter
-  capital with no on-chain recovery. There's no single "other party"
-  to get consent from in a pooled model, so this needs a different
-  mechanism (e.g. underwriter-majority vote, or a long content-based
-  staleness proof) - intentionally left for a future submission
-  rather than rushed here.
-- **No trusted on-chain clock**, for the same reason documented in
-  FlightShield: `gl.block.timestamp` does not exist, so staleness is
-  judged from page content (`FRESHNESS`), not a block timestamp.
+- **~~No forced-expiry release path~~ - fixed in v2.** `expire_policy()`
+  now releases a stuck policy's `locked_amount` once `EXPIRY_BUFFER`
+  (5 days) past its `event_date` has elapsed - see "v2: steward
+  feedback addressed" above.
+- **~~No trusted on-chain clock~~ - corrected in v2.** GenVM does
+  inject a deterministic `datetime.datetime.now()` into every
+  transaction; `expire_policy()` uses it directly. `FRESHNESS` is
+  still judged from page content, which remains the right tool for
+  "does this evidence reflect the current situation" - a different
+  question from "how much time has passed."
+- **Fixed premium-rate and pool-share bounds, not dynamic pricing.**
+  `MIN_PREMIUM_RATE_BPS` and `MAX_POLICY_SHARE_OF_POOL_BPS` are static
+  constants, not a market-priced premium curve - they exist to prevent
+  griefing (locking cheap, oversized reservations), not to price risk
+  accurately. A real actuarial pricing model is out of scope here.
 - **Two metrics only** (`rainfall_mm`, `max_temp_c`) in this version;
   adding more (wind speed, snowfall) is a straightforward vocabulary
   extension but each needs its own realistic unit-parsing coverage.

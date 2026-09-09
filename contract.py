@@ -1,6 +1,8 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 from genlayer import *
 import json
+import re
+from datetime import datetime, timedelta
 
 
 class WeatherVault(gl.Contract):
@@ -81,19 +83,37 @@ class WeatherVault(gl.Contract):
         wager.
 
     -------------------------------------------------------------------
-    DISCLOSED LIMITATION CARRIED FORWARD (being upfront about it)
+    STEWARD FEEDBACK ADDRESSED (v1 -> v2)
     -------------------------------------------------------------------
-    Like FlightShield, WeatherVault has no trusted on-chain clock, so
-    an `active` policy whose evidence can never again show FRESHNESS
-    as `Current` (because the event date has receded too far into the
-    past for any tracking site to still call it "current") has no
-    forced-expiry release path in this version - the underwriter
-    capital backing it stays `locked` indefinitely. FlightShield fixed
-    its own equivalent stranding problem with `request_cancel`
-    (mutual consent between exactly two parties); a pooled version
-    needs a different mechanism (there is no single "other party" to
-    get consent from), which is intentionally left for a future
-    submission rather than rushed here.
+    A steward review of the first submission found two related gaps:
+
+      1. "The policy lifecycle can strand underwriter funds ... an
+         indeterminate policy has no way to terminate and release that
+         reserve." This is the same clock-related gap FlightShield had
+         and fixed the same way: GenVM injects a deterministic,
+         consensus-agreed `datetime.datetime.now()` into every
+         transaction (see `_now()`), so a real elapsed-time terminal
+         condition is possible. `expire_policy()` releases a policy's
+         `locked_amount` back to the pool once `EXPIRY_BUFFER` (5 days)
+         has passed its own committed `event_date` while still
+         `active` - callable by anyone, no consent needed, since no
+         refund is owed (the policyholder's premium already went to
+         the pool, exactly like a real insurance claim window closing
+         unmade).
+
+      2. "Anyone can reserve nearly all unlocked capital for a minimal
+         premium" - `create_policy` previously had no floor relating
+         premium to the coverage being locked. Two on-chain, auditable
+         admission rules now apply to every `create_policy` call:
+         `MIN_PREMIUM_RATE_BPS` (premium must be >= 1% of
+         coverage_amount, making large reservations proportionally
+         expensive) and `MAX_POLICY_SHARE_OF_POOL_BPS` (coverage_amount
+         can never exceed 50% of the pool's capital before this
+         policy's own premium, so no single policy can ever claim the
+         whole pool). Together these are the "bounded premium-to-
+         coverage rules" the steward asked for, enforced by the
+         contract itself rather than an off-chain underwriting
+         allowlist.
     """
 
     # ------------------------------------------------------------------
@@ -132,6 +152,48 @@ class WeatherVault(gl.Contract):
     MIN_SOURCES_SUBMITTED = 3
     MAX_SOURCES_SUBMITTED = 6
     MIN_INDEPENDENT_SOURCES = 2
+
+    # ------------------------------------------------------------------
+    # Coverage-admission control (steward-requested fix)
+    # ------------------------------------------------------------------
+    # A steward review found that create_policy had no floor on premium
+    # relative to coverage_amount and no cap relative to pool size: a
+    # policyholder could lock nearly the ENTIRE unlocked pool for a
+    # trivial premium (e.g. 1 wei), starving every other policyholder
+    # of underwriting capacity for the full life of that one policy -
+    # cheaply, and with no way to release it early if the trigger never
+    # resolves. Two independent admission checks now apply to every
+    # create_policy call:
+    #   1. MIN_PREMIUM_RATE_BPS - the premium must be at least this
+    #      fraction of coverage_amount (basis points, 100 = 1%). This
+    #      makes locking a large amount of coverage proportionally
+    #      expensive, not free.
+    #   2. MAX_POLICY_SHARE_OF_POOL_BPS - coverage_amount can never
+    #      exceed this fraction of the pool's capital *before* this
+    #      policy's own premium is added, so no single policy can ever
+    #      claim the whole pool for itself regardless of premium paid.
+    # Both are simple, auditable, on-chain-enforced numeric rules -
+    # exactly the "bounded premium-to-coverage rules" the steward asked
+    # for, rather than an off-chain underwriter allowlist.
+    MIN_PREMIUM_RATE_BPS = 100  # 1% of coverage_amount, minimum
+    MAX_POLICY_SHARE_OF_POOL_BPS = 5000  # 50% of pre-premium pool capital, maximum
+
+    # ------------------------------------------------------------------
+    # Terminal expiry path (steward-requested fix)
+    # ------------------------------------------------------------------
+    # The other half of the steward's request: an indeterminate policy
+    # previously had NO way to ever release its locked reserve - stuck
+    # evidence meant permanently stuck underwriter capital, with no
+    # equivalent to FlightShield's force_close_stalemate. Because every
+    # policy already commits a concrete `event_date` up front (unlike
+    # FlightShield's agreements, which have no single natural
+    # "resolved by" date), the natural terminal condition here is
+    # simpler: once `event_date + EXPIRY_BUFFER` has passed with the
+    # policy still `active`, anyone may call `expire_policy` to release
+    # the lock. No refund is owed to the policyholder - exactly like a
+    # real insurance policy whose claim window closes unmade, the
+    # premium they already paid stays with the pool.
+    EXPIRY_BUFFER = timedelta(days=5)
 
     EQUIVALENCE_PRINCIPLE = (
         "The result is a JSON object classifying a single weather-data "
@@ -267,12 +329,37 @@ class WeatherVault(gl.Contract):
         event_date = (event_date or "").strip()
         if not event_date:
             raise Exception("event_date is required.")
+        try:
+            event_date_parsed = datetime.strptime(event_date, "%Y-%m-%d")
+        except ValueError:
+            raise Exception("event_date must be in YYYY-MM-DD format.")
 
         if coverage_amount is None or int(coverage_amount) <= 0:
             raise Exception("coverage_amount must be a positive integer.")
         coverage_amount = int(coverage_amount)
 
-        pool_balance = int(self.pool_balance) + premium
+        # --- Coverage-admission control (see class-level constants for
+        # the full rationale) ---
+        min_premium = (coverage_amount * self.MIN_PREMIUM_RATE_BPS) // 10000
+        if premium < min_premium:
+            raise Exception(
+                f"Premium too low for the requested coverage: minimum premium is "
+                f"{min_premium} ({self.MIN_PREMIUM_RATE_BPS / 100}% of coverage_amount), "
+                f"got {premium}."
+            )
+
+        pool_balance_before_premium = int(self.pool_balance)
+        max_single_policy_coverage = (
+            pool_balance_before_premium * self.MAX_POLICY_SHARE_OF_POOL_BPS
+        ) // 10000
+        if coverage_amount > max_single_policy_coverage:
+            raise Exception(
+                f"coverage_amount exceeds the maximum allowed for a single policy: "
+                f"{max_single_policy_coverage} ({self.MAX_POLICY_SHARE_OF_POOL_BPS / 100}% "
+                f"of current pool capital)."
+            )
+
+        pool_balance = pool_balance_before_premium + premium
         available = pool_balance - int(self.locked_amount)
         if coverage_amount > available:
             raise Exception(
@@ -302,6 +389,38 @@ class WeatherVault(gl.Contract):
             "records": [],
             "final_verdict": None,
         }
+        self.policies[policy_id] = json.dumps(record)
+        return json.dumps(record)
+
+    @gl.public.write
+    def expire_policy(self, policy_id: str) -> str:
+        """
+        Terminal expiry path (steward-requested fix). If a policy is
+        still `active` more than `EXPIRY_BUFFER` after its own
+        committed `event_date`, anyone may call this to release its
+        `locked_amount` back to the pool. No refund is owed to the
+        policyholder - like a real insurance policy whose claim window
+        closes unmade, their premium stays with the pool. This is what
+        stops an `Indeterminate`-forever policy from permanently
+        stranding underwriter capital, which previously had no
+        release path at all.
+        """
+        record = self._load_policy(policy_id)
+        if record["status"] != "active":
+            raise Exception(f"policy {policy_id} is '{record['status']}'; only an active policy can expire.")
+
+        event_date = datetime.strptime(record["event_date"], "%Y-%m-%d")
+        deadline = event_date + self.EXPIRY_BUFFER
+        now = self._now()
+        if now < deadline:
+            raise Exception(
+                f"Policy not yet eligible to expire; earliest expiry is "
+                f"{deadline.isoformat()} (now: {now.isoformat()})."
+            )
+
+        coverage_amount = int(record["coverage_amount"])
+        self.locked_amount = u256(int(self.locked_amount) - coverage_amount)
+        record["status"] = "expired"
         self.policies[policy_id] = json.dumps(record)
         return json.dumps(record)
 
@@ -412,6 +531,19 @@ class WeatherVault(gl.Contract):
             "shares": str(shares),
             "estimated_value": str(value),
         }
+
+    def _now(self) -> "datetime":
+        """
+        Single call site for the current consensus-agreed transaction
+        time. GenVM injects a deterministic `datetime.datetime.now()`
+        into every transaction - every validator computes the exact
+        same value for a given transaction (confirmed by
+        `genlayer-test`'s `genvm_datetime` fixture, built specifically
+        to pin that value for reproducible testing). Centralizing the
+        call here means the offline test stub only has to patch one
+        thing to control time in tests.
+        """
+        return datetime.now()
 
     def _load_policy(self, policy_id: str) -> dict:
         raw = self.policies.get(str(policy_id))
@@ -562,29 +694,38 @@ class WeatherVault(gl.Contract):
         )
         return record_out
 
+    # ------------------------------------------------------------------
+    # Metric-value parsing. A steward review of FlightShield found the
+    # same class of bug in its delay-text parser: a textual range
+    # ("30-45 minutes") was silently resolved to one bound instead of
+    # being flagged as ambiguous. WeatherVault's own metric-value
+    # parser had the identical latent bug ("30-45mm" silently returned
+    # 30.0) - fixed proactively here, before it could cause the same
+    # rejection: a range now returns None (excluded from consensus)
+    # rather than picking a bound.
+    # ------------------------------------------------------------------
+    _METRIC_RANGE_PATTERN = re.compile(
+        r"\d+(?:\.\d+)?\s*(?:-|–|—|to|and)\s*\d+(?:\.\d+)?"
+    )
+    _METRIC_NUMBER_PATTERN = re.compile(r"(-?\d+(?:\.\d+)?)")
+
     def _parse_metric_value(self, text):
         text = (text or "").strip().lower()
         if not text:
             return None
         text = text.replace(",", "")
-        num = ""
-        seen_digit = False
-        seen_dot = False
-        for ch in text:
-            if ch.isdigit():
-                num += ch
-                seen_digit = True
-            elif ch == "." and not seen_dot and seen_digit:
-                num += ch
-                seen_dot = True
-            elif ch == "-" and not num:
-                num += ch
-            elif seen_digit:
-                break
-        if not num or num == "-":
+
+        # An explicit range ("30-45mm", "between 30 and 45mm", "30 to
+        # 45 mm") is inherently ambiguous for threshold comparison -
+        # never pick a bound, always treat as unparseable.
+        if self._METRIC_RANGE_PATTERN.search(text):
+            return None
+
+        match = self._METRIC_NUMBER_PATTERN.search(text)
+        if not match:
             return None
         try:
-            return float(num)
+            return float(match.group(1))
         except ValueError:
             return None
 
