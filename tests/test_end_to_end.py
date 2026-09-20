@@ -14,12 +14,14 @@ def set_pipeline(render_value, prompt_value):
 TRIGGERED_PROMPT = {
     "LOCATION_MATCH": "Match",
     "FRESHNESS": "Current",
+    "DATA_TYPE": "Observed",
     "METRIC_VALUE": "75",
     "UNIT": "mm",
 }
 NOPAYOUT_PROMPT = {
     "LOCATION_MATCH": "Match",
     "FRESHNESS": "Current",
+    "DATA_TYPE": "Observed",
     "METRIC_VALUE": "5",
     "UNIT": "mm",
 }
@@ -32,6 +34,8 @@ THREE_URLS = [
 
 
 T0 = datetime(2026, 9, 1, 12, 0, 0)
+DEFAULT_EVENT_DATE = "2026-09-10"
+AFTER_DEFAULT_EVENT_DATE = datetime(2026, 9, 10, 0, 0, 1)
 
 
 class BaseCase(unittest.TestCase):
@@ -57,13 +61,25 @@ class BaseCase(unittest.TestCase):
         metric="rainfall_mm",
         comparison="gte",
         threshold="50",
-        event_date="2026-09-10",
+        event_date=DEFAULT_EVENT_DATE,
     ):
         with tx_context(sender, premium):
             raw = self.c.create_policy(
                 city, metric, comparison, threshold, event_date, coverage, "test"
             )
         return json.loads(raw)
+
+    def resolve_after_event(self, policy_id, urls, when=AFTER_DEFAULT_EVENT_DATE):
+        """
+        Advances the contract's notion of 'now' past the policy's
+        event_date (as resolve_policy now requires, steward fix
+        v2 -> v3) and then resolves. Tests that only care about the
+        resolution outcome, not the timing gate itself, should go
+        through this helper rather than calling resolve_policy
+        directly at the creation-time 'now'.
+        """
+        set_now(when)
+        return self.c.resolve_policy(policy_id, urls)
 
 
 class TestDeposit(BaseCase):
@@ -92,7 +108,7 @@ class TestDeposit(BaseCase):
         # simulate pool growth via a resolved NoPayout policy premium
         self.create_policy(premium=1000, coverage=100)
         set_pipeline("page", NOPAYOUT_PROMPT)
-        self.c.resolve_policy("0", THREE_URLS)
+        self.resolve_after_event("0", THREE_URLS)
         # pool is now 2000 (1000 deposit + 1000 premium), total_shares still 1000
         rec = self.deposit("0xU2", 2000)
         # 2000 * 1000 // 2000 = 1000 shares for 2000 GEN (pool was richer per share)
@@ -152,40 +168,40 @@ class TestCreatePolicyValidation(BaseCase):
     def test_requires_positive_premium(self):
         with self.assertRaises(Exception):
             with tx_context("0xP1", 0):
-                self.c.create_policy("London", "rainfall_mm", "gte", "50", "2026-09-10", 100, "x")
+                self.c.create_policy("London", "rainfall_mm", "gte", "50", DEFAULT_EVENT_DATE, 100, "x")
 
     def test_requires_city(self):
         with self.assertRaises(Exception):
             with tx_context("0xP1", 10):
-                self.c.create_policy("  ", "rainfall_mm", "gte", "50", "2026-09-10", 100, "x")
+                self.c.create_policy("  ", "rainfall_mm", "gte", "50", DEFAULT_EVENT_DATE, 100, "x")
 
     def test_rejects_bad_metric(self):
         with self.assertRaises(Exception):
             with tx_context("0xP1", 10):
-                self.c.create_policy("London", "wind_speed", "gte", "50", "2026-09-10", 100, "x")
+                self.c.create_policy("London", "wind_speed", "gte", "50", DEFAULT_EVENT_DATE, 100, "x")
 
     def test_rejects_bad_comparison(self):
         with self.assertRaises(Exception):
             with tx_context("0xP1", 10):
-                self.c.create_policy("London", "rainfall_mm", "eq", "50", "2026-09-10", 100, "x")
+                self.c.create_policy("London", "rainfall_mm", "eq", "50", DEFAULT_EVENT_DATE, 100, "x")
 
     def test_rejects_non_numeric_threshold(self):
         with self.assertRaises(Exception):
             with tx_context("0xP1", 10):
                 self.c.create_policy(
-                    "London", "rainfall_mm", "gte", "abc", "2026-09-10", 100, "x"
+                    "London", "rainfall_mm", "gte", "abc", DEFAULT_EVENT_DATE, 100, "x"
                 )
 
     def test_rejects_zero_coverage(self):
         with self.assertRaises(Exception):
             with tx_context("0xP1", 10):
-                self.c.create_policy("London", "rainfall_mm", "gte", "50", "2026-09-10", 0, "x")
+                self.c.create_policy("London", "rainfall_mm", "gte", "50", DEFAULT_EVENT_DATE, 0, "x")
 
     def test_rejects_coverage_exceeding_available_pool(self):
         with self.assertRaises(Exception):
             with tx_context("0xP1", 10):
                 self.c.create_policy(
-                    "London", "rainfall_mm", "gte", "50", "2026-09-10", 999999, "x"
+                    "London", "rainfall_mm", "gte", "50", DEFAULT_EVENT_DATE, 999999, "x"
                 )
 
     def test_success_locks_coverage_and_credits_premium(self):
@@ -198,14 +214,15 @@ class TestCreatePolicyValidation(BaseCase):
 
     def test_policy_count_increments(self):
         self.create_policy()
-        self.create_policy()
+        self.create_policy(event_date="2026-09-11")
         self.assertEqual(self.c.total_policies(), 2)
 
 
 class TestCoverageAdmissionControl(BaseCase):
     """
-    Steward-requested fix: bounded premium-to-coverage rules that
-    prevent locking most of the pool for a trivial premium.
+    Steward-requested fix (v1 -> v2): bounded premium-to-coverage
+    rules that prevent locking most of the pool for a trivial
+    premium.
     """
 
     def test_min_premium_rate_blocks_griefing_low_premium(self):
@@ -246,24 +263,61 @@ class TestCoverageAdmissionControl(BaseCase):
             self.create_policy(premium=50000, coverage=6000)
 
 
+class TestPolicyHorizon(BaseCase):
+    """
+    Steward-requested fix (v2 -> v3): a minimal premium must not be
+    able to reserve pool capital against an event_date arbitrarily
+    far in the future. MAX_POLICY_HORIZON bounds how far out
+    event_date may be, measured from the moment create_policy runs.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.deposit("0xU1", 100000)
+
+    def test_rejects_event_date_in_the_past(self):
+        with self.assertRaises(Exception):
+            self.create_policy(event_date="2026-08-01")  # before T0
+
+    def test_rejects_event_date_equal_to_now(self):
+        # event_date parses to midnight; T0 is the same day at noon,
+        # so it is not strictly in the future.
+        with self.assertRaises(Exception):
+            self.create_policy(event_date="2026-09-01")
+
+    def test_rejects_event_date_beyond_horizon(self):
+        too_far = (T0 + self.c.MAX_POLICY_HORIZON + timedelta(days=1)).strftime("%Y-%m-%d")
+        with self.assertRaises(Exception):
+            self.create_policy(event_date=too_far)
+
+    def test_accepts_event_date_at_horizon_boundary(self):
+        at_boundary = (T0 + self.c.MAX_POLICY_HORIZON).strftime("%Y-%m-%d")
+        rec = self.create_policy(event_date=at_boundary)
+        self.assertEqual(rec["status"], "active")
+
+    def test_accepts_event_date_well_within_horizon(self):
+        rec = self.create_policy(event_date="2026-09-15")
+        self.assertEqual(rec["status"], "active")
+
+
 class TestExpirePolicy(BaseCase):
     def test_cannot_expire_before_event_date_plus_buffer(self):
         self.deposit("0xU1", 100000)
-        self.create_policy(event_date="2026-09-10")
+        self.create_policy(event_date=DEFAULT_EVENT_DATE)
         set_now(datetime(2026, 9, 12))  # event date passed, buffer has not
         with self.assertRaises(Exception):
             self.c.expire_policy("0")
 
     def test_can_expire_exactly_at_buffer_deadline(self):
         self.deposit("0xU1", 100000)
-        self.create_policy(event_date="2026-09-10")
+        self.create_policy(event_date=DEFAULT_EVENT_DATE)
         set_now(datetime(2026, 9, 10) + self.c.EXPIRY_BUFFER)
         rec = json.loads(self.c.expire_policy("0"))
         self.assertEqual(rec["status"], "expired")
 
     def test_expiry_releases_lock_with_no_payout(self):
         self.deposit("0xU1", 100000)
-        self.create_policy(premium=500, coverage=40000, event_date="2026-09-10")
+        self.create_policy(premium=500, coverage=40000, event_date=DEFAULT_EVENT_DATE)
         set_now(datetime(2026, 9, 10) + self.c.EXPIRY_BUFFER + timedelta(days=1))
         rec = json.loads(self.c.expire_policy("0"))
         self.assertEqual(rec["status"], "expired")
@@ -274,24 +328,25 @@ class TestExpirePolicy(BaseCase):
 
     def test_only_active_policy_can_expire(self):
         self.deposit("0xU1", 100000)
-        self.create_policy(premium=500, coverage=40000, event_date="2026-09-10")
+        self.create_policy(premium=500, coverage=40000, event_date=DEFAULT_EVENT_DATE)
         set_pipeline(
             "page",
             {
                 "LOCATION_MATCH": "Match",
                 "FRESHNESS": "Current",
+                "DATA_TYPE": "Observed",
                 "METRIC_VALUE": "5",
                 "UNIT": "mm",
             },
         )
-        self.c.resolve_policy("0", THREE_URLS)  # -> resolved_nopay
+        self.resolve_after_event("0", THREE_URLS)  # -> resolved_nopay
         set_now(datetime(2026, 9, 10) + self.c.EXPIRY_BUFFER + timedelta(days=1))
         with self.assertRaises(Exception):
             self.c.expire_policy("0")
 
     def test_cannot_expire_twice(self):
         self.deposit("0xU1", 100000)
-        self.create_policy(event_date="2026-09-10")
+        self.create_policy(event_date=DEFAULT_EVENT_DATE)
         set_now(datetime(2026, 9, 10) + self.c.EXPIRY_BUFFER)
         self.c.expire_policy("0")
         with self.assertRaises(Exception):
@@ -299,7 +354,7 @@ class TestExpirePolicy(BaseCase):
 
     def test_callable_by_anyone(self):
         self.deposit("0xU1", 100000)
-        self.create_policy(event_date="2026-09-10")
+        self.create_policy(event_date=DEFAULT_EVENT_DATE)
         set_now(datetime(2026, 9, 10) + self.c.EXPIRY_BUFFER)
         with tx_context("0xSomeoneElse"):
             rec = json.loads(self.c.expire_policy("0"))
@@ -322,14 +377,17 @@ class TestResolvePolicy(BaseCase):
         self.create_policy(premium=100, coverage=3000)
 
     def test_cannot_resolve_too_few_sources(self):
+        set_now(AFTER_DEFAULT_EVENT_DATE)
         with self.assertRaises(Exception):
             self.c.resolve_policy("0", THREE_URLS[:2])
 
     def test_cannot_resolve_unknown_policy(self):
+        set_now(AFTER_DEFAULT_EVENT_DATE)
         with self.assertRaises(Exception):
             self.c.resolve_policy("999", THREE_URLS)
 
     def test_insufficient_distinct_domains_rejected(self):
+        set_now(AFTER_DEFAULT_EVENT_DATE)
         with self.assertRaises(Exception):
             self.c.resolve_policy(
                 "0",
@@ -340,9 +398,22 @@ class TestResolvePolicy(BaseCase):
                 ],
             )
 
+    def test_cannot_resolve_before_event_date(self):
+        # Steward-requested fix (v2 -> v3): resolve_policy must not
+        # run before its own committed event_date, still T0 here.
+        set_pipeline("page", TRIGGERED_PROMPT)
+        with self.assertRaises(Exception):
+            self.c.resolve_policy("0", THREE_URLS)
+
+    def test_can_resolve_exactly_at_event_date(self):
+        set_pipeline("page", TRIGGERED_PROMPT)
+        set_now(datetime(2026, 9, 10))  # exactly the event_date, not after it
+        rec = json.loads(self.c.resolve_policy("0", THREE_URLS))
+        self.assertEqual(rec["status"], "resolved_paid")
+
     def test_payout_triggered_pays_policyholder_and_releases_lock(self):
         set_pipeline("page", TRIGGERED_PROMPT)
-        rec = json.loads(self.c.resolve_policy("0", THREE_URLS))
+        rec = json.loads(self.resolve_after_event("0", THREE_URLS))
         self.assertEqual(rec["status"], "resolved_paid")
         self.assertEqual(transfers(), [{"to": "0xP1", "value": 3000}])
         state = json.loads(self.c.vault_state())
@@ -351,7 +422,7 @@ class TestResolvePolicy(BaseCase):
 
     def test_no_payout_keeps_premium_in_pool_and_releases_lock(self):
         set_pipeline("page", NOPAYOUT_PROMPT)
-        rec = json.loads(self.c.resolve_policy("0", THREE_URLS))
+        rec = json.loads(self.resolve_after_event("0", THREE_URLS))
         self.assertEqual(rec["status"], "resolved_nopay")
         self.assertEqual(transfers(), [])
         state = json.loads(self.c.vault_state())
@@ -361,20 +432,57 @@ class TestResolvePolicy(BaseCase):
     def test_indeterminate_stays_active_and_keeps_lock(self):
         stale_prompt = dict(TRIGGERED_PROMPT, FRESHNESS="Stale")
         set_pipeline("page", stale_prompt)
-        rec = json.loads(self.c.resolve_policy("0", THREE_URLS))
+        rec = json.loads(self.resolve_after_event("0", THREE_URLS))
         self.assertEqual(rec["final_verdict"], "Indeterminate")
         state = json.loads(self.c.vault_state())
         self.assertEqual(state["locked_amount"], "3000")
         self.assertEqual(transfers(), [])
 
+    def test_forecast_source_excluded_from_consensus(self):
+        # Steward-requested fix (v2 -> v3): a page predicting the
+        # weather for event_date, rather than reporting what was
+        # actually measured, must not count as evidence even if it
+        # matches location and is otherwise "current".
+        forecast_prompt = dict(TRIGGERED_PROMPT, DATA_TYPE="Forecast")
+        set_pipeline("page", forecast_prompt)
+        rec = json.loads(self.resolve_after_event("0", THREE_URLS))
+        self.assertEqual(rec["final_verdict"], "Indeterminate")
+        for r in rec["records"]:
+            self.assertEqual(r["quality_flag"], "forecast_not_observed")
+
+    def test_unknown_data_type_excluded_from_consensus(self):
+        unknown_prompt = dict(TRIGGERED_PROMPT, DATA_TYPE="Unknown")
+        set_pipeline("page", unknown_prompt)
+        rec = json.loads(self.resolve_after_event("0", THREE_URLS))
+        self.assertEqual(rec["final_verdict"], "Indeterminate")
+        for r in rec["records"]:
+            self.assertEqual(r["quality_flag"], "forecast_not_observed")
+
+    def test_missing_data_type_field_treated_as_unknown_and_excluded(self):
+        # A source that omits DATA_TYPE entirely (e.g. an older or
+        # malformed model response) must fail closed, not be silently
+        # treated as an observation.
+        no_data_type_prompt = {
+            "LOCATION_MATCH": "Match",
+            "FRESHNESS": "Current",
+            "METRIC_VALUE": "75",
+            "UNIT": "mm",
+        }
+        set_pipeline("page", no_data_type_prompt)
+        rec = json.loads(self.resolve_after_event("0", THREE_URLS))
+        self.assertEqual(rec["final_verdict"], "Indeterminate")
+        for r in rec["records"]:
+            self.assertEqual(r["quality_flag"], "forecast_not_observed")
+
     def test_cannot_resolve_already_resolved_policy(self):
         set_pipeline("page", TRIGGERED_PROMPT)
-        self.c.resolve_policy("0", THREE_URLS)
+        self.resolve_after_event("0", THREE_URLS)
         with self.assertRaises(Exception):
             self.c.resolve_policy("0", THREE_URLS)
 
     def test_resolver_identity_does_not_affect_payout_destination(self):
         set_pipeline("page", TRIGGERED_PROMPT)
+        set_now(AFTER_DEFAULT_EVENT_DATE)
         with tx_context("0xSomeoneElse", 0):
             rec = json.loads(self.c.resolve_policy("0", THREE_URLS))
         self.assertEqual(rec["policyholder_address"], "0xP1")
@@ -398,18 +506,21 @@ class TestResolvePolicy(BaseCase):
                 return {
                     "LOCATION_MATCH": "Match",
                     "FRESHNESS": "Current",
+                    "DATA_TYPE": "Observed",
                     "METRIC_VALUE": "23",
                     "UNIT": "C",
                 }
             return {
                 "LOCATION_MATCH": "Match",
                 "FRESHNESS": "Current",
+                "DATA_TYPE": "Observed",
                 "METRIC_VALUE": "73.4",
                 "UNIT": "F",
             }
 
         gl.nondet.web.render = lambda url, mode="text": "page"
         gl.nondet.exec_prompt = alternating_prompt
+        set_now(AFTER_DEFAULT_EVENT_DATE)
 
         rec = json.loads(self.c.resolve_policy("0", THREE_URLS))
         values = [r["metric_value"] for r in rec["records"] if r.get("quality_flag") == "ok"]
@@ -422,11 +533,12 @@ class TestResolvePolicy(BaseCase):
             {
                 "LOCATION_MATCH": "Match",
                 "FRESHNESS": "Current",
+                "DATA_TYPE": "Observed",
                 "METRIC_VALUE": "75",
                 "UNIT": "kelvin",
             },
         )
-        rec = json.loads(self.c.resolve_policy("0", THREE_URLS))
+        rec = json.loads(self.resolve_after_event("0", THREE_URLS))
         self.assertEqual(rec["final_verdict"], "Indeterminate")
         for r in rec["records"]:
             self.assertEqual(r["quality_flag"], "unit_unclear")
@@ -436,15 +548,15 @@ class TestSolvencyInvariant(BaseCase):
     def test_multiple_policies_cannot_over_lock_pool(self):
         self.deposit("0xU1", 10000)
         self.create_policy(premium=100, coverage=4000)
-        self.create_policy(premium=100, coverage=3000)
+        self.create_policy(premium=100, coverage=3000, event_date="2026-09-11")
         # third policy should fail: only ~3300 unlocked left after the first two
         with self.assertRaises(Exception):
-            self.create_policy(premium=100, coverage=3500)
+            self.create_policy(premium=100, coverage=3500, event_date="2026-09-12")
 
     def test_underwriter_cannot_withdraw_below_locked_floor_across_policies(self):
         self.deposit("0xU1", 10000)
         self.create_policy(coverage=3000)
-        self.create_policy(coverage=3000)
+        self.create_policy(coverage=3000, event_date="2026-09-11")
         # 6000 locked, 4000ish available; try to withdraw all shares
         with self.assertRaises(Exception):
             with tx_context("0xU1"):
