@@ -28,6 +28,19 @@ policy lifecycle. Both are fixed, tested, and documented in
 | An indeterminate policy has no way to terminate and release its reserve | `expire_policy()` - callable by anyone, releases `locked_amount` once `EXPIRY_BUFFER` (5 days) has passed the policy's own `event_date` while still `active`; no refund owed, same as a real insurance claim window closing unmade |
 | Anyone can reserve nearly all unlocked capital for a minimal premium | Two on-chain admission rules in `create_policy`: `MIN_PREMIUM_RATE_BPS` (premium must be >= 1% of coverage_amount) and `MAX_POLICY_SHARE_OF_POOL_BPS` (a single policy can never lock more than 50% of the pool's capital before its own premium) |
 
+## v3: steward feedback addressed
+
+A second steward review found that the v2 admission rules bounded how
+much of the pool a policy could lock, but not for how long or on what
+evidence. All three are fixed, tested, and documented in `contract.py`'s
+class docstring (see "STEWARD FEEDBACK ADDRESSED (v2 -> v3)"):
+
+| Steward request | Fix |
+|---|---|
+| A minimum premium can reserve up to half the pool until an arbitrarily distant date | `MAX_POLICY_HORIZON` (60 days) - `create_policy` now rejects any `event_date` more than 60 days from the moment the policy is created, in addition to the existing size caps |
+| Resolution should not be possible until the insured event date has occurred | `resolve_policy` now rejects any call where the current on-chain time is still before the policy's own `event_date` |
+| Requires observed date-specific weather rather than forecast data | Sources are now also classified by a `DATA_TYPE` field ("Observed" \| "Forecast" \| "Unknown"); only a page reporting an already-measured observation counts toward consensus - a forecast page is excluded via `quality_flag: "forecast_not_observed"` |
+
 This uses the same clock correction documented in FlightShield's v2:
 GenVM injects a deterministic, consensus-agreed `datetime.datetime.now()`
 into every transaction, so real elapsed-time terminal conditions are
@@ -226,6 +239,21 @@ for its metric is excluded from consensus (`quality_flag:
 test (`test_sources_reporting_different_units_still_reach_consensus`)
 that reconstructs the exact 23C/73.4F scenario and asserts both
 values now normalize to the same canonical temperature.
+
+### v3 live testing results on Studio
+
+Redeployed to a fresh address and re-verified against the three v3
+steward requests directly on-chain:
+
+| Steward request | Live result |
+|---|---|
+| Bounded policy horizon | Confirmed: `create_policy` with an `event_date` past `MAX_POLICY_HORIZON` was rejected with `event_date is too far in the future`; the same call inside the window succeeded |
+| Block resolution before `event_date` | Confirmed: `resolve_policy` called before the policy's `event_date` was rejected with `resolve_policy cannot run before the insured event_date`; calling it once the date had passed proceeded normally |
+| Observed vs. forecast (`DATA_TYPE`) | Verified via the offline suite (forecast, unknown, and missing-`DATA_TYPE` cases all correctly excluded with `quality_flag: "forecast_not_observed"`). Live re-verification on Studio was inconclusive for reasons unrelated to the fix: `gl.nondet.web.render` returned `inaccessible` for every accuweather.com/timeanddate.com page tried and for most weather.gov paths, most likely bot-protection or JS-rendering on those sites' side rather than a contract issue - this class of source-fetch flakiness pre-dates v3 and isn't something this fix changes |
+
+The v2 admission-control rules (`MIN_PREMIUM_RATE_BPS`,
+`MAX_POLICY_SHARE_OF_POOL_BPS`) were also re-verified live on this new
+deployment and still hold.
 
 ## Known limitations
 

@@ -1,4 +1,5 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+
 from genlayer import *
 import json
 import re
@@ -72,48 +73,84 @@ class WeatherVault(gl.Contract):
     -------------------------------------------------------------------
     WHAT'S GENUINELY NEW HERE
     -------------------------------------------------------------------
-      - A share-based vault (`deposit` / `withdraw`) instead of a
-        single locked stake - real proportional-ownership accounting,
-        the first primitive in this portfolio that isn't a 1:1 bet.
-      - `locked_amount` reserve accounting enforcing pool solvency
-        across MANY simultaneously-active policies, not just one.
-      - Premiums, not stakes: a policyholder risks a small premium for
-        a large coverage amount, funded by many underwriters' pooled
-        capital - the actual shape of real insurance, not a symmetric
-        wager.
+    - A share-based vault (`deposit` / `withdraw`) instead of a
+      single locked stake - real proportional-ownership accounting,
+      the first primitive in this portfolio that isn't a 1:1 bet.
+    - `locked_amount` reserve accounting enforcing pool solvency
+      across MANY simultaneously-active policies, not just one.
+    - Premiums, not stakes: a policyholder risks a small premium for
+      a large coverage amount, funded by many underwriters' pooled
+      capital - the actual shape of real insurance, not a symmetric
+      wager.
 
     -------------------------------------------------------------------
     STEWARD FEEDBACK ADDRESSED (v1 -> v2)
     -------------------------------------------------------------------
     A steward review of the first submission found two related gaps:
 
-      1. "The policy lifecycle can strand underwriter funds ... an
-         indeterminate policy has no way to terminate and release that
-         reserve." This is the same clock-related gap FlightShield had
-         and fixed the same way: GenVM injects a deterministic,
-         consensus-agreed `datetime.datetime.now()` into every
-         transaction (see `_now()`), so a real elapsed-time terminal
-         condition is possible. `expire_policy()` releases a policy's
-         `locked_amount` back to the pool once `EXPIRY_BUFFER` (5 days)
-         has passed its own committed `event_date` while still
-         `active` - callable by anyone, no consent needed, since no
-         refund is owed (the policyholder's premium already went to
-         the pool, exactly like a real insurance claim window closing
-         unmade).
+    1. "The policy lifecycle can strand underwriter funds ... an
+       indeterminate policy has no way to terminate and release that
+       reserve." This is the same clock-related gap FlightShield had
+       and fixed the same way: GenVM injects a deterministic,
+       consensus-agreed `datetime.datetime.now()` into every
+       transaction (see `_now()`), so a real elapsed-time terminal
+       condition is possible. `expire_policy()` releases a policy's
+       `locked_amount` back to the pool once `EXPIRY_BUFFER` (5 days)
+       has passed its own committed `event_date` while still
+       `active` - callable by anyone, no consent needed, since no
+       refund is owed (the policyholder's premium already went to
+       the pool, exactly like a real insurance claim window closing
+       unmade).
+    2. "Anyone can reserve nearly all unlocked capital for a minimal
+       premium" - `create_policy` previously had no floor relating
+       premium to the coverage being locked. Two on-chain, auditable
+       admission rules now apply to every `create_policy` call:
+       `MIN_PREMIUM_RATE_BPS` (premium must be >= 1% of
+       coverage_amount, making large reservations proportionally
+       expensive) and `MAX_POLICY_SHARE_OF_POOL_BPS` (coverage_amount
+       can never exceed 50% of the pool's capital before this
+       policy's own premium, so no single policy can ever claim the
+       whole pool).
 
-      2. "Anyone can reserve nearly all unlocked capital for a minimal
-         premium" - `create_policy` previously had no floor relating
-         premium to the coverage being locked. Two on-chain, auditable
-         admission rules now apply to every `create_policy` call:
-         `MIN_PREMIUM_RATE_BPS` (premium must be >= 1% of
-         coverage_amount, making large reservations proportionally
-         expensive) and `MAX_POLICY_SHARE_OF_POOL_BPS` (coverage_amount
-         can never exceed 50% of the pool's capital before this
-         policy's own premium, so no single policy can ever claim the
-         whole pool). Together these are the "bounded premium-to-
-         coverage rules" the steward asked for, enforced by the
-         contract itself rather than an off-chain underwriting
-         allowlist.
+    -------------------------------------------------------------------
+    STEWARD FEEDBACK ADDRESSED (v2 -> v3)
+    -------------------------------------------------------------------
+    A second steward review found that the v2 admission rules bounded
+    the SIZE of a reservation but not its DURATION or its evidentiary
+    basis, leaving three related gaps:
+
+    3a. "A minimum premium can reserve up to half the pool until an
+        arbitrarily distant date." `MIN_PREMIUM_RATE_BPS` /
+        `MAX_POLICY_SHARE_OF_POOL_BPS` bound how much of the pool a
+        single policy can lock, but placed no limit on how FAR in the
+        future `event_date` could be - a policyholder could still lock
+        a large amount of capital very cheaply for a very long time.
+        `MAX_POLICY_HORIZON` now caps every policy's `event_date` to
+        within a fixed window from the moment `create_policy` is
+        called (checked against the same deterministic, consensus-
+        agreed `_now()` used by `expire_policy`), so no policy can
+        reserve capital indefinitely far out.
+    3b. "Resolution should not be possible until the insured event
+        date has occurred." `resolve_policy` previously had no check
+        against the current time at all - it could be called (and
+        could pay out or foreclose a claim) before the event it was
+        insuring against had even happened. `resolve_policy` now
+        rejects any call where `_now()` is still before the policy's
+        own `event_date`, exactly mirroring the terminal-side timing
+        already enforced by `expire_policy`.
+    3c. "Requires observed date-specific weather rather than forecast
+        data." The LLM classification previously only checked
+        LOCATION_MATCH and FRESHNESS, either of which a forward-
+        looking forecast page for the correct city and date could
+        satisfy. Sources are now also classified by a `DATA_TYPE`
+        field ("Observed" | "Forecast" | "Unknown"); only a page the
+        model identifies as reporting an already-occurred, measured
+        observation (not a prediction) counts toward consensus - a
+        forecast page is excluded via `quality_flag:
+        "forecast_not_observed"`, the same way a stale or mismatched
+        page already was.
+
+    -------------------------------------------------------------------
     """
 
     # ------------------------------------------------------------------
@@ -131,11 +168,12 @@ class WeatherVault(gl.Contract):
     # ------------------------------------------------------------------
     LOCATION_MATCH_WORDS = ("Match", "Mismatch", "Unclear")
     FRESHNESS_WORDS = ("Current", "Stale", "Unknown")
+    DATA_TYPE_WORDS = ("Observed", "Forecast", "Unknown")
     FETCH_STATUSES = ("ok", "empty", "timeout", "inaccessible", "malformed")
     METRICS = ("rainfall_mm", "max_temp_c")
     COMPARISONS = ("gte", "lte")
     FINAL_VERDICTS = ("PayoutTriggered", "NoPayout", "Indeterminate")
-    POLICY_STATUSES = ("active", "resolved_paid", "resolved_nopay")
+    POLICY_STATUSES = ("active", "resolved_paid", "resolved_nopay", "expired")
 
     REPUTABLE_WEATHER_DOMAINS = frozenset(
         {
@@ -146,7 +184,6 @@ class WeatherVault(gl.Contract):
             "weather.com",
         }
     )
-
     KNOWN_MULTI_PART_SUFFIXES = ("co.uk", "com.au", "co.jp", "com.br")
 
     MIN_SOURCES_SUBMITTED = 3
@@ -154,7 +191,7 @@ class WeatherVault(gl.Contract):
     MIN_INDEPENDENT_SOURCES = 2
 
     # ------------------------------------------------------------------
-    # Coverage-admission control (steward-requested fix)
+    # Coverage-admission control (steward-requested fix, v1 -> v2)
     # ------------------------------------------------------------------
     # A steward review found that create_policy had no floor on premium
     # relative to coverage_amount and no cap relative to pool size: a
@@ -172,21 +209,33 @@ class WeatherVault(gl.Contract):
     #      exceed this fraction of the pool's capital *before* this
     #      policy's own premium is added, so no single policy can ever
     #      claim the whole pool for itself regardless of premium paid.
-    # Both are simple, auditable, on-chain-enforced numeric rules -
-    # exactly the "bounded premium-to-coverage rules" the steward asked
-    # for, rather than an off-chain underwriter allowlist.
     MIN_PREMIUM_RATE_BPS = 100  # 1% of coverage_amount, minimum
     MAX_POLICY_SHARE_OF_POOL_BPS = 5000  # 50% of pre-premium pool capital, maximum
 
     # ------------------------------------------------------------------
-    # Terminal expiry path (steward-requested fix)
+    # Policy horizon bound (steward-requested fix, v2 -> v3)
     # ------------------------------------------------------------------
-    # The other half of the steward's request: an indeterminate policy
-    # previously had NO way to ever release its locked reserve - stuck
-    # evidence meant permanently stuck underwriter capital, with no
-    # equivalent to FlightShield's force_close_stalemate. Because every
-    # policy already commits a concrete `event_date` up front (unlike
-    # FlightShield's agreements, which have no single natural
+    # A second steward review found that MIN_PREMIUM_RATE_BPS /
+    # MAX_POLICY_SHARE_OF_POOL_BPS bound HOW MUCH of the pool a policy
+    # can lock, but nothing bounded HOW LONG it could stay locked: a
+    # policyholder could still pay the minimum premium and reserve up
+    # to half the pool against an event_date arbitrarily far in the
+    # future. MAX_POLICY_HORIZON caps every policy's event_date to
+    # within this window of the moment create_policy is called
+    # (measured against the same deterministic on-chain clock used by
+    # expire_policy), so a minimal premium can never lock capital
+    # indefinitely.
+    MAX_POLICY_HORIZON = timedelta(days=60)
+
+    # ------------------------------------------------------------------
+    # Terminal expiry path (steward-requested fix, v1 -> v2)
+    # ------------------------------------------------------------------
+    # The other half of the original steward request: an indeterminate
+    # policy previously had NO way to ever release its locked reserve -
+    # stuck evidence meant permanently stuck underwriter capital, with
+    # no equivalent to FlightShield's force_close_stalemate. Because
+    # every policy already commits a concrete `event_date` up front
+    # (unlike FlightShield's agreements, which have no single natural
     # "resolved by" date), the natural terminal condition here is
     # simpler: once `event_date + EXPIRY_BUFFER` has passed with the
     # policy still `active`, anyone may call `expire_policy` to release
@@ -199,11 +248,11 @@ class WeatherVault(gl.Contract):
         "The result is a JSON object classifying a single weather-data "
         "web page. Two results are equivalent if and only if they agree "
         "on every categorical field (fetch_status, location_match, "
-        "freshness) and, taking UNIT into account, on the METRIC_VALUE "
-        "field's real-world meaning (e.g. '23' with unit 'C' and '73.4' "
-        "with unit 'F' are equivalent; '23' with unit 'C' and '30' with "
-        "unit 'C' are not). Minor wording differences in free-text "
-        "fields do not affect equivalence."
+        "freshness, data_type) and, taking UNIT into account, on the "
+        "METRIC_VALUE field's real-world meaning (e.g. '23' with unit "
+        "'C' and '73.4' with unit 'F' are equivalent; '23' with unit "
+        "'C' and '30' with unit 'C' are not). Minor wording differences "
+        "in free-text fields do not affect equivalence."
     )
 
     def __init__(self):
@@ -234,11 +283,12 @@ class WeatherVault(gl.Contract):
             minted = amount
         else:
             minted = (amount * int(self.total_shares)) // int(self.pool_balance)
-            if minted <= 0:
-                raise Exception(
-                    "deposit amount too small to mint any shares at the current "
-                    "pool valuation."
-                )
+
+        if minted <= 0:
+            raise Exception(
+                "deposit amount too small to mint any shares at the current "
+                "pool valuation."
+            )
 
         current = int(self.underwriter_shares.get(sender, "0"))
         self.underwriter_shares[sender] = str(current + minted)
@@ -257,10 +307,11 @@ class WeatherVault(gl.Contract):
         """
         if shares is None or int(shares) <= 0:
             raise Exception("withdraw requires a positive share amount.")
-        shares = int(shares)
 
+        shares = int(shares)
         sender = str(gl.message.sender_address)
         held = int(self.underwriter_shares.get(sender, "0"))
+
         if shares > held:
             raise Exception(f"You hold {held} shares, cannot withdraw {shares}.")
 
@@ -280,11 +331,11 @@ class WeatherVault(gl.Contract):
             del self.underwriter_shares[sender]
         else:
             self.underwriter_shares[sender] = str(remaining)
+
         self.total_shares = u256(total_shares - shares)
         self.pool_balance = u256(pool_balance - amount)
 
         gl.get_contract_at(Address(sender)).emit_transfer(value=amount)
-
         return json.dumps(self._vault_summary(sender))
 
     # ==================================================================
@@ -318,6 +369,7 @@ class WeatherVault(gl.Contract):
 
         if metric not in self.METRICS:
             raise Exception(f"metric must be one of {self.METRICS}.")
+
         if comparison not in self.COMPARISONS:
             raise Exception(f"comparison must be one of {self.COMPARISONS}.")
 
@@ -333,6 +385,22 @@ class WeatherVault(gl.Contract):
             event_date_parsed = datetime.strptime(event_date, "%Y-%m-%d")
         except ValueError:
             raise Exception("event_date must be in YYYY-MM-DD format.")
+
+        # --- Policy horizon bound (steward-requested fix, v2 -> v3):
+        # event_date must be in the future, and no further out than
+        # MAX_POLICY_HORIZON from right now - see class-level constant
+        # for the full rationale. ---
+        now = self._now()
+        if event_date_parsed <= now:
+            raise Exception("event_date must be in the future.")
+
+        horizon_deadline = now + self.MAX_POLICY_HORIZON
+        if event_date_parsed > horizon_deadline:
+            raise Exception(
+                f"event_date is too far in the future: a policy's event_date must "
+                f"be within {self.MAX_POLICY_HORIZON.days} days of when it is "
+                f"created (latest allowed here: {horizon_deadline.date().isoformat()})."
+            )
 
         if coverage_amount is None or int(coverage_amount) <= 0:
             raise Exception("coverage_amount must be a positive integer.")
@@ -434,10 +502,24 @@ class WeatherVault(gl.Contract):
         stays in the pool for underwriters. Callable by anyone - the
         payout destination and amount were both fixed at
         create_policy time, never supplied by the resolver.
+
+        Steward-requested fix (v2 -> v3): resolution cannot run until
+        the insured event_date has actually occurred - previously
+        this had no time check at all, and could be called (and pay
+        out or foreclose a claim) before the event being insured
+        against had even happened.
         """
         record = self._load_policy(policy_id)
         if record["status"] != "active":
             raise Exception(f"policy {policy_id} is '{record['status']}', not active.")
+
+        event_date_parsed = datetime.strptime(record["event_date"], "%Y-%m-%d")
+        now = self._now()
+        if now < event_date_parsed:
+            raise Exception(
+                f"resolve_policy cannot run before the insured event_date "
+                f"({record['event_date']}); current time is {now.isoformat()}."
+            )
 
         if not isinstance(source_urls, list):
             raise Exception("source_urls must be a list of URLs.")
@@ -619,11 +701,11 @@ class WeatherVault(gl.Contract):
             prompt = self._build_prompt(content, city, event_date, metric)
             raw = gl.nondet.exec_prompt(prompt, response_format="json")
             parsed = raw if isinstance(raw, dict) else json.loads(raw)
-
             return {
                 "fetch_status": "ok",
                 "location_match": parsed.get("LOCATION_MATCH", "Unclear"),
                 "freshness": parsed.get("FRESHNESS", "Unknown"),
+                "data_type": parsed.get("DATA_TYPE", "Unknown"),
                 "metric_value": parsed.get("METRIC_VALUE", ""),
                 "unit": parsed.get("UNIT", "Unknown"),
             }
@@ -659,20 +741,37 @@ class WeatherVault(gl.Contract):
         location_match = result.get("location_match", "Unclear")
         if location_match not in self.LOCATION_MATCH_WORDS:
             location_match = "Unclear"
+
         freshness = result.get("freshness", "Unknown")
         if freshness not in self.FRESHNESS_WORDS:
             freshness = "Unknown"
+
+        data_type = result.get("data_type", "Unknown")
+        if data_type not in self.DATA_TYPE_WORDS:
+            data_type = "Unknown"
+
         metric_text = result.get("metric_value", "")
         unit_text = result.get("unit", "Unknown")
 
         record_out["location_match"] = location_match
         record_out["freshness"] = freshness
+        record_out["data_type"] = data_type
 
         if location_match != "Match":
             record_out["quality_flag"] = "location_or_date_mismatch"
             return record_out
+
         if freshness != "Current":
             record_out["quality_flag"] = "stale_or_unknown_freshness"
+            return record_out
+
+        # Steward-requested fix (v2 -> v3): a page can be about the
+        # right city, and even framed as "current" news, while still
+        # being a FORECAST rather than an actual observed reading for
+        # event_date. Only an observed measurement counts as evidence
+        # for settlement.
+        if data_type != "Observed":
+            record_out["quality_flag"] = "forecast_not_observed"
             return record_out
 
         raw_value = self._parse_metric_value(metric_text)
@@ -769,13 +868,11 @@ class WeatherVault(gl.Contract):
         if metric == "max_temp_c":
             # unit must be "F" here (the only non-canonical option)
             return (value - 32.0) * 5.0 / 9.0
-
         if metric == "rainfall_mm":
             if unit == "cm":
                 return value * 10.0
             if unit == "in":
                 return value * 25.4
-
         return None
 
     def _normalize_unit_text(self, unit_text: str):
@@ -836,6 +933,7 @@ Return exactly this JSON shape:
 {{
   "LOCATION_MATCH": "Match" | "Mismatch" | "Unclear",
   "FRESHNESS": "Current" | "Stale" | "Unknown",
+  "DATA_TYPE": "Observed" | "Forecast" | "Unknown",
   "METRIC_VALUE": "<the numeric {metric_label} as stated on the page, e.g. '42', 'N/A' if not present>",
   "UNIT": "<the unit the page actually used, e.g. 'C', 'F', 'mm', 'in' - whatever unit is on the page, do not convert it>"
 }}
@@ -846,6 +944,15 @@ Rules:
 - FRESHNESS is "Current" only if the page appears to reflect the
   actual weather data for {event_date} specifically, not a different
   date or a multi-day forecast average.
+- DATA_TYPE is "Observed" only if the page reports weather that has
+  ALREADY happened and been measured for {event_date} - an actual,
+  recorded, past-tense reading (e.g. "actual conditions", "recorded
+  high", "observed", a historical/climate-data lookup). Set it to
+  "Forecast" if the page is predicting weather for {event_date}
+  instead of reporting what was actually measured (e.g. "forecast",
+  "expected", "chance of", "outlook"). Use "Unknown" only if you truly
+  cannot tell whether the figure is a forecast or an actual
+  observation.
 - METRIC_VALUE must be copied/paraphrased from the page, never
   invented. Do not do any unit conversion or arithmetic yourself -
   just report the number as shown on the page.
